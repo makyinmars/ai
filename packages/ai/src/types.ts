@@ -25,6 +25,10 @@ export interface Tool {
   execute?: (args: any) => Promise<string> | string;
 }
 
+export interface ToolConfig {
+  [key: string]: Tool
+}
+
 export interface ChatCompletionOptions {
   model: string;
   messages: Message[];

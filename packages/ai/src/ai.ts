@@ -9,6 +9,7 @@ import type {
   SummarizationResult,
   EmbeddingOptions,
   EmbeddingResult,
+  Tool,
 } from "./types";
 
 type AdapterMap = Record<string, AIAdapter<readonly string[]>>;
@@ -24,7 +25,13 @@ type AdapterFallback<TAdapters extends AdapterMap> = {
   };
 }[keyof TAdapters & string];
 
-interface AIConfig<T extends AdapterMap> {
+// Type for tool registry - maps tool names to their Tool definitions
+type ToolRegistry = Record<string, Tool>;
+
+// Extract tool names from a registry
+type ToolNames<TTools extends ToolRegistry> = keyof TTools & string;
+
+interface AIConfig<T extends AdapterMap, TTools extends ToolRegistry = ToolRegistry> {
   adapters: T;
   /**
    * Default fallback configuration.
@@ -32,11 +39,16 @@ interface AIConfig<T extends AdapterMap> {
    * Each fallback specifies both the adapter name and the model to use with that adapter.
    */
   fallbacks?: ReadonlyArray<AdapterFallback<T>>;
+  /**
+   * Tool registry - define all available tools here.
+   * Tools can then be referenced by name in chat options.
+   */
+  tools?: TTools;
 }
 
 // Create discriminated union for adapter options with model constraint
-type ChatOptionsWithAdapter<TAdapters extends AdapterMap> = {
-  [K in keyof TAdapters & string]: Omit<ChatCompletionOptions, "model"> & {
+type ChatOptionsWithAdapter<TAdapters extends AdapterMap, TTools extends ToolRegistry = ToolRegistry> = {
+  [K in keyof TAdapters & string]: Omit<ChatCompletionOptions, "model" | "tools"> & {
     adapter: K;
     model: ExtractModels<TAdapters[K]>;
     /**
@@ -51,13 +63,18 @@ type ChatOptionsWithAdapter<TAdapters extends AdapterMap> = {
      * - "response": Returns a Response object with proper headers for HTTP streaming
      */
     as?: "promise" | "stream" | "response";
+    /**
+     * Array of tool names to use for this chat.
+     * Tools must be registered in the AI constructor.
+     */
+    tools?: ReadonlyArray<ToolNames<TTools>>;
   };
 }[keyof TAdapters & string];
 
 // Create options type for fallback-only mode (no primary adapter)
-type ChatOptionsWithFallback<TAdapters extends AdapterMap> = Omit<
+type ChatOptionsWithFallback<TAdapters extends AdapterMap, TTools extends ToolRegistry = ToolRegistry> = Omit<
   ChatCompletionOptions,
-  "model"
+  "model" | "tools"
 > & {
   /**
    * Ordered list of fallbacks to try. If the first fails, will try the next, and so on.
@@ -71,6 +88,11 @@ type ChatOptionsWithFallback<TAdapters extends AdapterMap> = Omit<
    * - "response": Returns a Response object with proper headers for HTTP streaming
    */
   as?: "promise" | "stream" | "response";
+  /**
+   * Array of tool names to use for this chat.
+   * Tools must be registered in the AI constructor.
+   */
+  tools?: ReadonlyArray<ToolNames<TTools>>;
 };
 
 type TextGenerationOptionsWithAdapter<TAdapters extends AdapterMap> = {
@@ -136,13 +158,15 @@ type EmbeddingOptionsWithFallback<TAdapters extends AdapterMap> = Omit<
   fallbacks: ReadonlyArray<AdapterFallback<TAdapters>>;
 };
 
-export class AI<T extends AdapterMap = AdapterMap> {
+export class AI<T extends AdapterMap = AdapterMap, TTools extends ToolRegistry = ToolRegistry> {
   private adapters: T;
   private fallbacks?: ReadonlyArray<AdapterFallback<T>>;
+  private tools: TTools;
 
-  constructor(config: AIConfig<T>) {
+  constructor(config: AIConfig<T, TTools>) {
     this.adapters = config.adapters;
     this.fallbacks = config.fallbacks;
+    this.tools = (config.tools || {}) as TTools;
   }
 
   /**
@@ -163,6 +187,33 @@ export class AI<T extends AdapterMap = AdapterMap> {
    */
   get adapterNames(): Array<keyof T & string> {
     return Object.keys(this.adapters) as Array<keyof T & string>;
+  }
+
+  /**
+   * Get a tool by name
+   */
+  getTool<K extends ToolNames<TTools>>(name: K): TTools[K] {
+    const tool = this.tools[name];
+    if (!tool) {
+      throw new Error(
+        `Tool "${name}" not found. Available tools: ${Object.keys(this.tools).join(", ")}`
+      );
+    }
+    return tool;
+  }
+
+  /**
+   * Get all tool names
+   */
+  get toolNames(): Array<ToolNames<TTools>> {
+    return Object.keys(this.tools) as Array<ToolNames<TTools>>;
+  }
+
+  /**
+   * Get tools by names
+   */
+  private getToolsByNames(names: ReadonlyArray<ToolNames<TTools>>): Tool[] {
+    return names.map(name => this.getTool(name));
   }
 
   /**
@@ -266,7 +317,7 @@ export class AI<T extends AdapterMap = AdapterMap> {
    * - "response": Response
    */
   chat<const TAs extends "promise" | "stream" | "response" = "promise">(
-    options: (ChatOptionsWithAdapter<T> | ChatOptionsWithFallback<T>) & { as?: TAs }
+    options: (ChatOptionsWithAdapter<T, TTools> | ChatOptionsWithFallback<T, TTools>) & { as?: TAs }
   ): TAs extends "stream"
     ? AsyncIterable<StreamChunk>
     : TAs extends "response"
@@ -289,13 +340,13 @@ export class AI<T extends AdapterMap = AdapterMap> {
    */
   private async chatPromise(
     options:
-      | ChatOptionsWithAdapter<T>
-      | ChatOptionsWithFallback<T>
+      | ChatOptionsWithAdapter<T, TTools>
+      | ChatOptionsWithFallback<T, TTools>
   ): Promise<ChatCompletionResult> {
     // Check if this is fallback-only mode (no primary adapter specified)
     if (!("adapter" in options)) {
       // Fallback-only mode
-      const { fallbacks, as, ...restOptions } = options;
+      const { fallbacks, as, tools, ...restOptions } = options;
       const fallbackList = fallbacks.length > 0 ? fallbacks : this.fallbacks;
 
       if (!fallbackList || fallbackList.length === 0) {
@@ -304,12 +355,16 @@ export class AI<T extends AdapterMap = AdapterMap> {
         );
       }
 
+      // Convert tool names to tool objects
+      const toolObjects = tools ? this.getToolsByNames(tools) : undefined;
+
       return this.tryWithFallback(
         fallbackList,
         async (fallback) => {
           return this.getAdapter(fallback.adapter).chatCompletion({
             ...restOptions,
             model: fallback.model,
+            tools: toolObjects,
           } as ChatCompletionOptions);
         },
         "chat"
@@ -317,18 +372,22 @@ export class AI<T extends AdapterMap = AdapterMap> {
     }
 
     // Single adapter mode (with optional fallbacks)
-    const { adapter, model, fallbacks, as, ...restOptions } = options;
+    const { adapter, model, fallbacks, as, tools, ...restOptions } = options;
 
     // Get fallback list (from options or constructor)
     const fallbackList = fallbacks && fallbacks.length > 0
       ? fallbacks
       : this.fallbacks;
 
+    // Convert tool names to tool objects
+    const toolObjects = tools ? this.getToolsByNames(tools) : undefined;
+
     // Try primary adapter first
     try {
       return await this.getAdapter(adapter).chatCompletion({
         ...restOptions,
         model,
+        tools: toolObjects,
       } as ChatCompletionOptions);
     } catch (primaryError: any) {
       // If no fallbacks available, throw the error
@@ -348,6 +407,7 @@ export class AI<T extends AdapterMap = AdapterMap> {
           return this.getAdapter(fallback.adapter).chatCompletion({
             ...restOptions,
             model: fallback.model,
+            tools: toolObjects,
           } as ChatCompletionOptions);
         },
         "chat (after primary failure)"
@@ -360,8 +420,8 @@ export class AI<T extends AdapterMap = AdapterMap> {
    */
   private chatResponse(
     options:
-      | ChatOptionsWithAdapter<T>
-      | ChatOptionsWithFallback<T>
+      | ChatOptionsWithAdapter<T, TTools>
+      | ChatOptionsWithFallback<T, TTools>
   ): Response {
     const { toStreamResponse } = require("./stream-to-response");
     return toStreamResponse(this.chatStream(options));
@@ -374,8 +434,8 @@ export class AI<T extends AdapterMap = AdapterMap> {
    */
   private async *chatStream(
     options:
-      | ChatOptionsWithAdapter<T>
-      | ChatOptionsWithFallback<T>
+      | ChatOptionsWithAdapter<T, TTools>
+      | ChatOptionsWithFallback<T, TTools>
   ): AsyncIterable<StreamChunk> {
     // Determine mode and extract values
     const isFallbackOnlyMode = !("adapter" in options);
@@ -384,11 +444,13 @@ export class AI<T extends AdapterMap = AdapterMap> {
     let modelToUse: string;
     let restOptions: any;
     let fallbackList: ReadonlyArray<AdapterFallback<T>> | undefined;
+    let toolNames: ReadonlyArray<ToolNames<TTools>> | undefined;
 
     if (isFallbackOnlyMode) {
       // Fallback-only mode
-      const { fallbacks, as, ...rest } = options;
+      const { fallbacks, as, tools, ...rest } = options;
       fallbackList = fallbacks && fallbacks.length > 0 ? fallbacks : this.fallbacks;
+      toolNames = tools;
 
       if (!fallbackList || fallbackList.length === 0) {
         throw new Error(
@@ -402,14 +464,19 @@ export class AI<T extends AdapterMap = AdapterMap> {
       restOptions = rest;
     } else {
       // Single adapter mode (with optional fallbacks)
-      const { adapter, model, fallbacks, as, ...rest } = options;
+      const { adapter, model, fallbacks, as, tools, ...rest } = options;
       adapterToUse = adapter;
       modelToUse = model;
       restOptions = rest;
+      toolNames = tools;
       fallbackList = fallbacks && fallbacks.length > 0 ? fallbacks : this.fallbacks;
     }
 
-    const hasToolExecutors = restOptions.tools?.some((t: any) => t.execute);
+    // Convert tool names to tool objects
+    const toolObjects = toolNames ? this.getToolsByNames(toolNames) : undefined;
+    restOptions.tools = toolObjects;
+
+    const hasToolExecutors = toolObjects?.some((t: any) => t.execute);
 
     // If in fallback-only mode without tool executors, use simple streaming with full fallback support
     if (isFallbackOnlyMode && !hasToolExecutors) {

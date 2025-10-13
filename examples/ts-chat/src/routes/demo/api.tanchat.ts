@@ -1,8 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { AI, toStreamResponse } from "@tanstack/ai";
+import { AI, Tool, ToolConfig } from "@tanstack/ai";
 import { OllamaAdapter } from "@tanstack/ai-ollama";
 import { OpenAIAdapter } from "@tanstack/ai-openai";
-import type { Tool } from "@tanstack/ai";
 
 import guitars from "@/data/example-guitars";
 
@@ -14,9 +13,9 @@ You can use the following tools to help the user:
 - recommendGuitar: Recommend a guitar to the user
 `;
 
-// Define tools with execute functions
-const tools: Tool[] = [
-  {
+// Define tools registry
+const tools = {
+  getGuitars: {
     type: "function",
     function: {
       name: "getGuitars",
@@ -31,7 +30,7 @@ const tools: Tool[] = [
       return JSON.stringify(guitars);
     },
   },
-  {
+  recommendGuitar: {
     type: "function",
     function: {
       name: "recommendGuitar",
@@ -51,7 +50,26 @@ const tools: Tool[] = [
       return JSON.stringify({ id });
     },
   },
-];
+} as const satisfies ToolConfig;
+
+// Initialize AI with tools in constructor
+const ai = new AI({
+  adapters: {
+    ollama: new OllamaAdapter({
+      apiKey: process.env.AI_KEY!,
+    }),
+    openAi: new OpenAIAdapter({
+      apiKey: process.env.AI_KEY!,
+    }),
+  },
+  fallbacks: [
+    {
+      adapter: "openAi",
+      model: "gpt-4",
+    },
+  ],
+  tools, // ← Register tools once here!
+});
 
 export const Route = createFileRoute("/demo/api/tanchat")({
   server: {
@@ -60,44 +78,26 @@ export const Route = createFileRoute("/demo/api/tanchat")({
         try {
           const { messages } = await request.json();
 
-          // Initialize AI with Anthropic
-          const ai = new AI(
-            {
-              adapters: {
-                ollama: new OllamaAdapter({
-                  apiKey: process.env.AI_KEY!,
-                }),
-                openAi: new OpenAIAdapter({
-                  apiKey: process.env.AI_KEY!,
-                }),
-              },
-              fallbacks: [{
-                adapter: "openAi",
-                model: "gpt-4"
-              }]
-            }
-          );
-
           // Add system message if not present
           const allMessages =
             messages[0]?.role === "system"
               ? messages
               : [{ role: "system", content: SYSTEM_PROMPT }, ...messages];
 
-          // streamChat automatically handles tool execution!
+          // Use tools by name - type-safe!
           return ai.chat({
             model: "gpt-4o",
             adapter: "openAi",
             fallbacks: [
               {
                 adapter: "ollama",
-                model: "gpt-oss:20b"
-              }
-
+                model: "gpt-oss:20b",
+              },
             ],
             as: "response",
             messages: allMessages,
             temperature: 0.7,
+            tools: ["getGuitars", "recommendGuitar"], // ← Type-safe tool names!
             toolChoice: "auto",
             maxIterations: 5,
           });
