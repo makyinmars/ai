@@ -2,8 +2,17 @@ import { createFileRoute } from "@tanstack/react-router";
 import { AI, tool } from "@tanstack/ai";
 import { OllamaAdapter } from "@tanstack/ai-ollama";
 import { OpenAIAdapter } from "@tanstack/ai-openai";
-
+import { wrapExternalProvider } from "@tanstack/ai";
+import { openai } from "@ai-sdk/openai"
+import type { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import guitars from "@/data/example-guitars";
+
+// this is how you would wrap any external provider to conform to our adapter interface
+// this returns a base-adapter conforming object that you can use in the adapters map
+// it should also be typesafe as our wrapper is
+// By specifying OpenAIResponsesProviderOptions as the type parameter, we get full type safety for providerOptions
+// Models are automatically inferred from the openai function parameter type
+const adapter = wrapExternalProvider<OpenAIResponsesProviderOptions>()(openai);
 
 const SYSTEM_PROMPT = `You are a helpful assistant for a store that sells guitars.
 
@@ -66,6 +75,8 @@ const ai = new AI({
     openAi: new OpenAIAdapter({
       apiKey: process.env.AI_KEY!,
     }),
+    // this works the same way as the adapters above because wrapper converted it to our convention
+    externalOpenAi: adapter
   },
   fallbacks: [
     {
@@ -94,6 +105,16 @@ export const Route = createFileRoute("/demo/api/tanchat")({
           model: "gpt-4o",
           adapter: "openAi",
           fallbacks: [
+            // I can add the external adapter as a fallback here with typesafe model config thanks to our wrapper
+            {
+              adapter: "externalOpenAi",
+              // this should be typesafe
+              model: "gpt-3.5-turbo",
+              // this should be typesafe
+              providerOptions: {
+                "instructions": "You are a helpful assistant that provides concise answers."
+              }
+            },
             {
               adapter: "ollama",
               model: "gpt-oss:20b",
